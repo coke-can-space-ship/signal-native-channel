@@ -17,6 +17,7 @@ use crate::linking;
 
 const CHANNEL_NAME: &str = "signal-native";
 const GROUP_TARGET_PREFIX: &str = "group:";
+const GROUP_MASTER_KEY_LEN: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Zeroclaw Channel trait types (mirrored from zeroclaw::channels::traits)
@@ -69,8 +70,6 @@ pub struct MediaAttachment {
 pub struct SignalNativeChannel {
     /// Path to the SQLite database that holds Signal protocol state.
     db_path: PathBuf,
-    /// Device name shown in Signal's "Linked Devices" list.
-    device_name: String,
     /// Phone numbers (E.164) or `"*"` for wildcard allowed senders.
     allowed_from: Vec<String>,
     /// If set, only accept messages from this group. `"dm"` = DMs only.
@@ -83,48 +82,45 @@ pub struct SignalNativeChannel {
 impl SignalNativeChannel {
     pub fn new(
         db_path: PathBuf,
-        device_name: String,
         allowed_from: Vec<String>,
         group_filter: Option<String>,
     ) -> Self {
         Self {
             db_path,
-            device_name,
             allowed_from,
             group_filter,
             manager: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Ensure the manager is loaded (or link if first run).
+    /// Load an already-linked manager from the store.
+    ///
+    /// This will NOT initiate device linking. If the device has not been linked
+    /// (via the `link` binary), this returns an error.
     async fn ensure_manager(&self) -> anyhow::Result<()> {
         let mut guard = self.manager.lock().await;
         if guard.is_some() {
             return Ok(());
         }
 
-        // Try loading an existing registration first.
-        match linking::load_registered(&self.db_path).await {
-            Ok(mgr) => {
-                tracing::info!("signal-native: loaded existing linked device");
-                *guard = Some(mgr);
-                Ok(())
-            }
-            Err(_) => {
-                tracing::info!("signal-native: no existing registration, starting device linking");
-                let mgr =
-                    linking::link_as_secondary(&self.db_path, &self.device_name).await?;
-                *guard = Some(mgr);
-                Ok(())
-            }
-        }
+        let mgr = linking::load_registered(&self.db_path).await.map_err(|e| {
+            anyhow::anyhow!(
+                "signal-native: no linked device found at {}. \
+                 Run the `link` binary first to link this device. \
+                 Original error: {e}",
+                self.db_path.display()
+            )
+        })?;
+        tracing::info!("signal-native: loaded existing linked device");
+        *guard = Some(mgr);
+        Ok(())
     }
 
-    fn is_sender_allowed(&self, sender: &str) -> bool {
+    fn is_sender_allowed(&self, sender_uuid: &str) -> bool {
         if self.allowed_from.iter().any(|s| s == "*") {
             return true;
         }
-        self.allowed_from.iter().any(|s| s == sender)
+        self.allowed_from.iter().any(|s| s == sender_uuid)
     }
 
     /// Parse a recipient string into a ServiceId (ACI UUID) or group master key bytes.
@@ -133,10 +129,16 @@ impl SignalNativeChannel {
             let bytes = hex::decode(group_key_hex).map_err(|e| {
                 SignalNativeError::InvalidRecipient(format!("bad group key hex: {e}"))
             })?;
+            if bytes.len() != GROUP_MASTER_KEY_LEN {
+                return Err(SignalNativeError::InvalidRecipient(format!(
+                    "group master key must be {GROUP_MASTER_KEY_LEN} bytes, got {}",
+                    bytes.len()
+                )));
+            }
             return Ok(RecipientTarget::Group(bytes));
         }
 
-        // Try UUID first (Signal's preferred addressing).
+        // Try UUID (Signal's preferred addressing).
         if let Ok(uuid) = Uuid::parse_str(recipient) {
             return Ok(RecipientTarget::Direct(ServiceId::Aci(uuid.into())));
         }
@@ -144,9 +146,9 @@ impl SignalNativeChannel {
         // E.164 phone numbers can't be directly resolved to a ServiceId without
         // a contact discovery lookup. For now, require UUID addressing.
         // TODO: implement CDSI contact discovery for phone number -> UUID resolution.
-        Err(SignalNativeError::InvalidRecipient(format!(
-            "recipient must be a UUID or group:<hex_master_key>, got: {recipient}"
-        )))
+        Err(SignalNativeError::InvalidRecipient(
+            "recipient must be a UUID or group:<hex_master_key>".to_string(),
+        ))
     }
 
     fn now_millis() -> u64 {
@@ -295,17 +297,18 @@ impl SignalNativeChannel {
     // -----------------------------------------------------------------------
 
     /// Extract a ChannelMessage from a decrypted Content, applying filters.
+    ///
+    /// Sync messages (messages sent from the primary device) are skipped to
+    /// avoid the bot responding to its own outbound messages.
     fn process_content(
         &self,
         content: &presage::libsignal_service::content::Content,
     ) -> Option<ChannelMessage> {
         let body = match &content.body {
             ContentBody::DataMessage(dm) => dm,
-            ContentBody::SynchronizeMessage(sync) => {
-                // Handle messages we sent from the primary device (sync messages).
-                // Extract the inner DataMessage if present.
-                sync.sent.as_ref()?.message.as_ref()?
-            }
+            // Skip sync messages — these are our own outbound messages echoed
+            // back from the primary device. Processing them would cause loops.
+            ContentBody::SynchronizeMessage(_) => return None,
             _ => return None,
         };
 
@@ -350,7 +353,10 @@ impl SignalNativeChannel {
         let timestamp_secs = timestamp_ms / 1000;
 
         Some(ChannelMessage {
-            id: format!("signative_{timestamp_ms}"),
+            id: format!(
+                "signative_{timestamp_ms}_{sender}",
+                sender = &sender_uuid[..8]
+            ),
             sender: sender_uuid,
             reply_target,
             content: text.to_string(),

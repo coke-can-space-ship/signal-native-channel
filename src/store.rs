@@ -11,21 +11,37 @@ pub fn default_db_path() -> PathBuf {
 
 /// Open (or create) the SQLite store at the given path.
 ///
-/// Uses `OnNewIdentity::Trust` so that new contacts are accepted without
-/// manual approval — appropriate for a bot/assistant use case.
+/// Uses `OnNewIdentity::Reject` so that identity key changes (potential MITM)
+/// are rejected rather than silently trusted.
 pub async fn open_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
     if let Some(parent) = db_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        create_dir_restricted(parent).await?;
     }
     let store = SqliteStore::open(
         db_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("db path is not valid UTF-8"))?,
-        OnNewIdentity::Trust,
+        OnNewIdentity::Reject,
     )
     .await
     .map_err(|e| anyhow::anyhow!("failed to open signal store: {e}"))?;
     Ok(store)
+}
+
+/// Create directories with mode 0700 (owner-only) to protect key material.
+async fn create_dir_restricted(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::create_dir_all(path).await?;
+    }
+    Ok(())
 }
 
 fn dirs_fallback() -> PathBuf {
