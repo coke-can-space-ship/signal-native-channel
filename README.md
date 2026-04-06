@@ -6,31 +6,41 @@ Communicates directly with Signal servers over WebSocket — no signal-cli, no R
 
 ## Architecture
 
+Runs as a **sidecar process** that bridges Signal (via presage) to ZeroClaw's [bridge WebSocket channel](https://github.com/zeroclaw-labs/zeroclaw/pull/2839) (shipping in the next zeroclaw release after v0.6.8).
+
 ```
-signal-native-channel
+Signal servers
+  |  (WebSocket + Signal Protocol)
+  v
+signal-bridge          <-- this project
+  |  (presage / libsignal)
   |
-  presage              (high-level client: link, send, receive, groups, storage)
-  |
-  libsignal-service-rs (server protocol, protobuf, transport)
-  |
-  libsignal            (Signal Protocol crypto, sealed sender, zkgroup)
+  |  Bridge WS protocol (localhost:8765/ws)
+  v
+ZeroClaw daemon
+  |  (bridge channel, #2816)
+  v
+Agent loop
 ```
 
 ### Source layout
 
 | File | Purpose |
 |---|---|
-| `src/channel.rs` | `SignalNativeChannel` — implements the ZeroClaw Channel interface |
+| `src/bridge.rs` | Bridge adapter — connects presage to ZeroClaw's bridge WS channel |
+| `src/channel.rs` | `SignalNativeChannel` — standalone Channel trait implementation |
 | `src/linking.rs` | Secondary device linking (QR code provisioning flow) |
 | `src/store.rs` | SQLite store open/init helpers |
 | `src/error.rs` | Error types |
-| `src/bin/link.rs` | Standalone binary for one-time device linking |
+| `src/bin/signal_bridge.rs` | Main binary — runs the bridge adapter process |
+| `src/bin/link.rs` | One-time device linking binary |
 
 ## Prerequisites
 
 - **Rust >= 1.89** (edition 2024)
 - **cmake** — needed to build BoringSSL (libsignal dependency)
 - **protobuf** — `protoc` compiler for protobuf codegen
+- **ZeroClaw** with bridge channel support (next release after v0.6.8)
 
 ```bash
 brew install cmake protobuf
@@ -44,21 +54,78 @@ cd signal-native-channel
 cargo build
 ```
 
-## Link your device
+This produces two binaries:
 
-Before using the channel, you need to link it as a secondary device to your Signal account. This is a one-time operation.
+- `target/debug/link` — one-time device linking
+- `target/debug/signal-bridge` — the bridge adapter (long-running sidecar)
+
+## Quick start
+
+### 1. Link your device (one-time)
 
 ```bash
-cargo run --bin link -- --device-name ZeroClaw --db-path ~/.zeroclaw/signal-native.db
+cargo run --bin link -- --device-name ZeroClaw
 ```
 
-This prints a QR code to the terminal. Scan it from your phone:
+Scan the QR code from your phone: **Signal -> Settings -> Linked Devices -> Link New Device**
 
-**Signal app -> Settings -> Linked Devices -> Link New Device**
+### 2. Configure ZeroClaw's bridge channel
 
-The `--db-path` flag controls where Signal protocol state (keys, sessions, contacts) is stored. Defaults to `~/.zeroclaw/signal-native.db` if omitted.
+Add to `~/.zeroclaw/config.toml`:
 
-The `--device-name` flag sets the name shown in Signal's Linked Devices list. Defaults to `ZeroClaw` if omitted.
+```toml
+[channels_config.bridge]
+bind_host = "127.0.0.1"
+bind_port = 8765
+path = "/ws"
+auth_token = "your-secret-token-here"
+allowed_senders = ["signal"]
+```
+
+### 3. Start ZeroClaw
+
+```bash
+zeroclaw daemon
+```
+
+### 4. Start the bridge
+
+```bash
+cargo run --bin signal-bridge -- \
+  --auth-token your-secret-token-here \
+  --sender-id signal \
+  --allowed-from '*'
+```
+
+Messages from Signal will now flow into ZeroClaw, and ZeroClaw's responses will be sent back through Signal.
+
+## signal-bridge options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--bridge-url` | `ws://127.0.0.1:8765/ws` | ZeroClaw bridge WebSocket endpoint |
+| `--auth-token` | (required) | Shared token matching `[channels_config.bridge].auth_token` |
+| `--sender-id` | `signal` | Identity registered with the bridge |
+| `--db-path` | `~/.zeroclaw/signal-native.db` | Presage SQLite database path |
+| `--allowed-from` | `*` | Comma-separated Signal sender UUIDs, or `*` for all |
+| `--group-filter` | (none) | `dm` for DMs only, or a hex group master key |
+
+## Bridge protocol
+
+The adapter speaks the bridge WebSocket protocol defined in [zeroclaw-labs/zeroclaw#2816](https://github.com/zeroclaw-labs/zeroclaw/issues/2816):
+
+**Inbound (adapter -> ZeroClaw):**
+- `{"type":"auth","token":"...","sender_id":"..."}` — first message, authenticates the connection
+- `{"type":"message","id":"...","sender_id":"...","content":"..."}` — forwarded Signal message
+
+**Outbound (ZeroClaw -> adapter):**
+- `{"type":"ready","sender_id":"...","endpoint":"..."}` — auth accepted
+- `{"type":"message","recipient":"...","content":"..."}` — send a message via Signal
+- `{"type":"typing","recipient":"...","active":true}` — typing indicator
+- `{"type":"draft",...}` — draft lifecycle events (start/update/finalize/cancel)
+- `{"type":"error","code":"...","message":"..."}` — error from bridge
+
+The adapter routes `message` and `typing` outbound events through presage. Draft and reaction events are acknowledged but have no Signal-side equivalent.
 
 ## Test
 
@@ -67,34 +134,32 @@ cargo test
 cargo check
 ```
 
-There are no integration tests yet (they require a linked Signal account). Unit tests cover error types and store path logic. To test end-to-end:
+End-to-end testing requires a linked device and a running ZeroClaw bridge:
 
-1. Link a device (see above)
-2. Send a message to your Signal number from another account
-3. Verify the channel receives and logs it
+1. Link a device (`cargo run --bin link`)
+2. Start ZeroClaw with bridge config
+3. Start `signal-bridge`
+4. Send a message to your Signal number from another account
+5. Verify ZeroClaw processes it and responds
 
 ## Contributing
 
-### Adding features
+### What's implemented
 
-The channel currently supports:
-
-- Receiving text messages (DM and group)
-- Sending text messages (by UUID or group master key)
+- Receiving text messages (DM and group) and forwarding to ZeroClaw
+- Sending text messages back through Signal (by UUID or group master key)
 - Typing indicators
-- Sync messages from primary device
+- Auth handshake with the bridge
+- Automatic reconnection with exponential backoff
 
-Not yet implemented:
+### Not yet implemented
 
-- **Phone number -> UUID resolution** via CDSI contact discovery (recipients must be UUIDs for now)
-- **Attachment send/receive** (presage supports this via `manager.get_attachment()` / `manager.upload_attachments()`)
-- **Reactions** via `add_reaction` / `remove_reaction` channel trait methods
+- **Phone number -> UUID resolution** via CDSI contact discovery
+- **Attachment send/receive** (presage supports `manager.get_attachment()` / `manager.upload_attachments()`)
+- **Reactions** (bridge protocol supports them, presage can send them)
 - **Read receipts**
-- **Group management** (join, leave, create)
 
 ### Code style
-
-Follow ZeroClaw conventions from [AGENTS.md](https://github.com/zeroclaw-labs/zeroclaw/blob/main/AGENTS.md). In short:
 
 - `cargo fmt` before committing
 - `cargo clippy` must pass
@@ -105,83 +170,10 @@ Follow ZeroClaw conventions from [AGENTS.md](https://github.com/zeroclaw-labs/ze
 
 presage and libsignal are not on crates.io — they are pulled as git dependencies. The `[patch.crates-io]` section in `Cargo.toml` is required for two forks:
 
-- `curve25519-dalek` — Signal's fork with custom optimizations
-- `libsqlite3-sys` — Whisperfish's fork with `bundled-sqlcipher-custom-crypto` feature
+- `curve25519-dalek` — Signal's fork
+- `libsqlite3-sys` — Whisperfish's fork with `bundled-sqlcipher-custom-crypto`
 
 Do not remove these patches or the build will fail.
-
-## Integrating into ZeroClaw
-
-### 1. Add the dependency
-
-In ZeroClaw's `Cargo.toml`, add signal-native-channel as a path or git dependency and copy the `[patch.crates-io]` entries:
-
-```toml
-[dependencies]
-signal-native-channel = { path = "../signal-native-channel" }
-# or
-signal-native-channel = { git = "<repo-url>" }
-
-[patch.crates-io]
-curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
-libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
-```
-
-### 2. Replace stub types
-
-`src/channel.rs` defines stub versions of `ChannelMessage`, `SendMessage`, and `MediaAttachment`. Replace them with real imports:
-
-```rust
-use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
-use crate::channels::media_pipeline::MediaAttachment;
-```
-
-Add `#[async_trait]` and change the inherent methods to trait impl:
-
-```rust
-#[async_trait]
-impl Channel for SignalNativeChannel {
-    fn name(&self) -> &str { ... }
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> { ... }
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> { ... }
-    async fn health_check(&self) -> bool { ... }
-    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> { ... }
-}
-```
-
-### 3. Add config section
-
-Add a new config struct in ZeroClaw's config module:
-
-```toml
-[channels_config.signal_native]
-db_path = "~/.zeroclaw/signal-native.db"
-device_name = "ZeroClaw"
-allowed_from = ["+12624003837"]
-group_id = "dm"
-```
-
-### 4. Register the channel
-
-In `src/channels/mod.rs` inside `collect_configured_channels()`, add:
-
-```rust
-if let Some(ref sn) = config.channels_config.signal_native {
-    channels.push(ConfiguredChannel {
-        display_name: "Signal (native)",
-        channel: Arc::new(SignalNativeChannel::new(
-            PathBuf::from(shellexpand::tilde(&sn.db_path).to_string()),
-            sn.device_name.clone(),
-            sn.allowed_from.clone(),
-            sn.group_id.clone(),
-        )),
-    });
-}
-```
-
-### 5. Feature-gate (optional)
-
-Consider gating behind a cargo feature like `channel-signal-native` to keep the default binary lean, since presage pulls in libsignal, BoringSSL, and ~300 transitive dependencies.
 
 ## License
 
