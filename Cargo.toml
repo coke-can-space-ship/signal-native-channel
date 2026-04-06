@@ -1,0 +1,46 @@
+[package]
+name = "signal-native-channel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Native Signal channel for ZeroClaw using presage (libsignal)"
+
+[dependencies]
+# Presage — high-level Signal client built on libsignal
+presage = { git = "https://github.com/whisperfish/presage" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage" }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+futures = "0.3"
+futures-util = "0.3"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+
+# QR code rendering (for device linking)
+qrcode = "0.14"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# URL type (for provisioning link)
+url = "2"
+
+# Logging subscriber (for link binary)
+tracing-subscriber = "0.3"
+
+[[bin]]
+name = "link"
+path = "src/bin/link.rs"
+
+[patch.crates-io]
+# Required: Signal's fork of curve25519-dalek
+curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
+# Required: whisperfish's rusqlite fork with bundled-sqlcipher-custom-crypto
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
