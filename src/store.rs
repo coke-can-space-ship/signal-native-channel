@@ -17,14 +17,17 @@ pub async fn open_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
     if let Some(parent) = db_path.parent() {
         create_dir_restricted(parent).await?;
     }
-    let store = SqliteStore::open(
+    // Prefix with sqlite: scheme so sqlx parses it as a file path correctly,
+    // and append ?mode=rwc to create if missing.
+    let url = format!(
+        "sqlite:{}?mode=rwc",
         db_path
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("db path is not valid UTF-8"))?,
-        OnNewIdentity::Reject,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to open signal store: {e}"))?;
+            .ok_or_else(|| anyhow::anyhow!("db path is not valid UTF-8"))?
+    );
+    let store = SqliteStore::open(&url, OnNewIdentity::Reject)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open signal store: {e}"))?;
     Ok(store)
 }
 

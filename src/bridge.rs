@@ -206,6 +206,10 @@ async fn run_session(
     let (signal_tx, mut signal_rx) = mpsc::channel::<String>(64);
     let (bridge_event_tx, mut bridge_event_rx) = mpsc::channel::<BridgeOutbound>(64);
 
+    // Track the last Signal sender so we can route replies back.
+    // Key: bridge sender_id ("signal"), Value: Signal UUID or group target.
+    let mut last_signal_sender: Option<String> = None;
+
     // Task: read from bridge WS, forward parsed events via mpsc
     let bridge_reader = tokio::spawn(async move {
         while let Some(msg) = ws_source.next().await {
@@ -270,12 +274,13 @@ async fn run_session(
                         tracing::debug!("signal: contacts synced");
                     }
                     Received::Content(content) => {
-                        if let Some(bridge_msg) = content_to_bridge_message(
+                        if let Some((bridge_msg, signal_reply_addr)) = content_to_bridge_message(
                             &content,
                             &config.allowed_from,
                             config.group_filter.as_deref(),
                             &config.sender_id,
                         ) {
+                            last_signal_sender = Some(signal_reply_addr);
                             let payload = serde_json::to_string(&bridge_msg)?;
                             if signal_tx.send(payload).await.is_err() {
                                 tracing::info!("bridge writer closed");
@@ -286,8 +291,12 @@ async fn run_session(
                 }
             }
             bridge_event = bridge_event_rx.recv() => {
-                let Some(event) = bridge_event else { break };
-                if let Err(e) = handle_outbound_event(&manager, event).await {
+                let Some(event) = bridge_event else {
+                    tracing::info!("bridge event channel closed");
+                    break;
+                };
+                tracing::info!("received bridge event: {event:?}");
+                if let Err(e) = handle_outbound_event(&manager, event, last_signal_sender.as_deref()).await {
                     tracing::warn!("failed to handle bridge event: {e}");
                 }
             }
@@ -303,12 +312,21 @@ async fn run_session(
 }
 
 /// Convert a presage Content into a bridge inbound message event.
+///
+/// The `sender_id` in the bridge message is set to the Signal sender's UUID
+/// (or `group:<hex_master_key>` for group messages) so that zeroclaw's reply
+/// routes back to the correct recipient via `parse_recipient`.
+/// Returns `(bridge_message, signal_reply_address)`.
+///
+/// The bridge message's `sender_id` is set to `bridge_sender_id` (the auth
+/// identity) to satisfy the bridge's sender_mismatch check. The actual Signal
+/// UUID is returned separately for reply routing.
 fn content_to_bridge_message(
     content: &presage::libsignal_service::content::Content,
     allowed_from: &[String],
     group_filter: Option<&str>,
-    sender_id: &str,
-) -> Option<BridgeInbound> {
+    bridge_sender_id: &str,
+) -> Option<(BridgeInbound, String)> {
     let body = match &content.body {
         ContentBody::DataMessage(dm) => dm,
         ContentBody::SynchronizeMessage(_) => return None,
@@ -345,23 +363,49 @@ fn content_to_bridge_message(
 
     let timestamp_ms = content.metadata.timestamp;
 
-    Some(BridgeInbound::Message {
-        id: format!("signative_{timestamp_ms}_{}", &from_uuid[..8]),
-        sender_id: sender_id.to_string(),
-        content: text.to_string(),
-    })
+    // Use the Signal UUID (or group key) as sender_id so zeroclaw's reply
+    // is addressed to a value that parse_recipient can resolve.
+    let reply_address = if let Some(ref gk) = group_master_key {
+        format!("{GROUP_TARGET_PREFIX}{gk}")
+    } else {
+        from_uuid.clone()
+    };
+
+    Some((
+        BridgeInbound::Message {
+            id: format!("signative_{timestamp_ms}_{}", &from_uuid[..8]),
+            sender_id: bridge_sender_id.to_string(),
+            content: text.to_string(),
+        },
+        reply_address,
+    ))
 }
 
 /// Handle an outbound event from zeroclaw by routing it through presage.
+///
+/// The `recipient` from zeroclaw is the bridge sender_id (e.g. "signal").
+/// We resolve it to the actual Signal address using `last_signal_sender`.
 async fn handle_outbound_event(
     manager: &Arc<Mutex<Manager<SqliteStore, Registered>>>,
     event: BridgeOutbound,
+    last_signal_sender: Option<&str>,
 ) -> anyhow::Result<()> {
     match event {
         BridgeOutbound::Message {
             recipient, content, ..
         } => {
-            let target = parse_recipient(&recipient)?;
+            // Try parsing the recipient directly (UUID or group key).
+            // If that fails, fall back to the last known Signal sender.
+            let effective_recipient = match parse_recipient(&recipient) {
+                Ok(_) => recipient.clone(),
+                Err(_) => last_signal_sender
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "cannot route reply to '{recipient}': no Signal sender known yet"
+                    ))?
+                    .to_string(),
+            };
+            tracing::info!("sending reply to Signal recipient: {effective_recipient}");
+            let target = parse_recipient(&effective_recipient)?;
             let timestamp = now_millis();
             let data_message = presage::libsignal_service::content::DataMessage {
                 body: Some(content),
@@ -389,7 +433,11 @@ async fn handle_outbound_event(
             recipient, active, ..
         } => {
             if active {
-                if let Ok(RecipientTarget::Direct(service_id)) = parse_recipient(&recipient) {
+                let effective = match parse_recipient(&recipient) {
+                    Ok(_) => recipient.clone(),
+                    Err(_) => last_signal_sender.unwrap_or_default().to_string(),
+                };
+                if let Ok(RecipientTarget::Direct(service_id)) = parse_recipient(&effective) {
                     let timestamp = now_millis();
                     let typing = ContentBody::TypingMessage(
                         presage::libsignal_service::proto::TypingMessage {
@@ -409,9 +457,43 @@ async fn handle_outbound_event(
                 }
             }
         }
-        // Draft, Reaction, Ack, Pong — no Signal-side action needed
+        // Draft finalize = the complete response. Send it as a Signal message.
+        BridgeOutbound::Draft {
+            event, text, ..
+        } => {
+            if event == "finalize" {
+                if let Some(text) = text {
+                    let effective_recipient = last_signal_sender
+                        .ok_or_else(|| anyhow::anyhow!("draft finalize but no Signal sender known"))?
+                        .to_string();
+                    tracing::info!("sending finalized draft to Signal recipient: {effective_recipient}");
+                    let target = parse_recipient(&effective_recipient)?;
+                    let timestamp = now_millis();
+                    let data_message = presage::libsignal_service::content::DataMessage {
+                        body: Some(text),
+                        timestamp: Some(timestamp),
+                        ..Default::default()
+                    };
+                    let mut guard = manager.lock().await;
+                    match target {
+                        RecipientTarget::Direct(service_id) => {
+                            guard.send_message(service_id, data_message, timestamp)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
+                        }
+                        RecipientTarget::Group(key_bytes) => {
+                            guard.send_message_to_group(&key_bytes, data_message, timestamp)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("group send failed: {e}"))?;
+                        }
+                    }
+                }
+            }
+            // Ignore draft start/update — only finalize triggers a Signal send
+        }
+        // Reaction, Ack, Pong — no Signal-side action needed
         BridgeOutbound::Pong { .. } | BridgeOutbound::Ack { .. } => {}
-        BridgeOutbound::Draft { .. } | BridgeOutbound::Reaction { .. } => {}
+        BridgeOutbound::Reaction { .. } => {}
         BridgeOutbound::Ready { .. } | BridgeOutbound::Error { .. } => {}
     }
 
