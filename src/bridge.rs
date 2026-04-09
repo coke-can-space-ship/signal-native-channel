@@ -211,7 +211,7 @@ async fn run_session(
     let mut last_signal_sender: Option<String> = None;
 
     // Task: read from bridge WS, forward parsed events via mpsc
-    let bridge_reader = tokio::spawn(async move {
+    let bridge_reader = tokio::task::spawn_local(async move {
         while let Some(msg) = ws_source.next().await {
             let text = match msg {
                 Ok(WsMessage::Text(t)) => t,
@@ -238,7 +238,7 @@ async fn run_session(
     });
 
     // Task: write to bridge WS (drains signal_rx mpsc)
-    let bridge_writer = tokio::spawn(async move {
+    let bridge_writer = tokio::task::spawn_local(async move {
         while let Some(payload) = signal_rx.recv().await {
             if ws_sink
                 .send(WsMessage::Text(payload.into()))

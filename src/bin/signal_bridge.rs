@@ -26,8 +26,7 @@ fn get_arg(flag: &str) -> Option<String> {
         .and_then(|i| std::env::args().nth(i + 1))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let auth_token = get_arg("--auth-token")
@@ -52,5 +51,11 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("  sender: {}", config.sender_id);
     eprintln!("  db:     {}", config.db_path.display());
 
-    bridge::run(config).await
+    // Use current_thread runtime with LocalSet because presage's
+    // receive_messages() stream uses spawn_local internally.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, bridge::run(config))
 }
