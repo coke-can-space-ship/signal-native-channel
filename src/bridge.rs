@@ -253,51 +253,71 @@ async fn run_session(
 
     // Current task: run the Signal listener (non-Send stream stays here)
     // and also poll bridge events in a select loop.
-    let messages = {
-        let mut guard = manager.lock().await;
-        guard
-            .receive_messages()
-            .await
-            .map_err(|e| anyhow::anyhow!("receive_messages failed: {e}"))?
-    };
-    futures_util::pin_mut!(messages);
+    // The presage stream can die independently of the bridge WS, so we
+    // reconnect it in a loop without tearing down the bridge connection.
+    let mut signal_retry_delay = Duration::from_secs(2);
+    let signal_max_delay = Duration::from_secs(60);
 
-    loop {
-        tokio::select! {
-            signal_item = messages.next() => {
-                let Some(item) = signal_item else { break };
-                match item {
-                    Received::QueueEmpty => {
-                        tracing::debug!("signal: initial queue drained");
-                    }
-                    Received::Contacts => {
-                        tracing::debug!("signal: contacts synced");
-                    }
-                    Received::Content(content) => {
-                        if let Some((bridge_msg, signal_reply_addr)) = content_to_bridge_message(
-                            &content,
-                            &config.allowed_from,
-                            config.group_filter.as_deref(),
-                            &config.sender_id,
-                        ) {
-                            last_signal_sender = Some(signal_reply_addr);
-                            let payload = serde_json::to_string(&bridge_msg)?;
-                            if signal_tx.send(payload).await.is_err() {
-                                tracing::info!("bridge writer closed");
-                                break;
+    'outer: loop {
+        let messages = {
+            let mut guard = manager.lock().await;
+            match guard.receive_messages().await {
+                Ok(stream) => {
+                    signal_retry_delay = Duration::from_secs(2);
+                    stream
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "signal: receive_messages failed: {e}, retrying in {signal_retry_delay:?}"
+                    );
+                    tokio::time::sleep(signal_retry_delay).await;
+                    signal_retry_delay = (signal_retry_delay * 2).min(signal_max_delay);
+                    continue;
+                }
+            }
+        };
+        futures_util::pin_mut!(messages);
+
+        loop {
+            tokio::select! {
+                signal_item = messages.next() => {
+                    let Some(item) = signal_item else {
+                        tracing::info!("signal: message stream ended, reconnecting presage...");
+                        break; // break inner loop, reconnect presage in outer loop
+                    };
+                    match item {
+                        Received::QueueEmpty => {
+                            tracing::debug!("signal: initial queue drained");
+                        }
+                        Received::Contacts => {
+                            tracing::debug!("signal: contacts synced");
+                        }
+                        Received::Content(content) => {
+                            if let Some((bridge_msg, signal_reply_addr)) = content_to_bridge_message(
+                                &content,
+                                &config.allowed_from,
+                                config.group_filter.as_deref(),
+                                &config.sender_id,
+                            ) {
+                                last_signal_sender = Some(signal_reply_addr);
+                                let payload = serde_json::to_string(&bridge_msg)?;
+                                if signal_tx.send(payload).await.is_err() {
+                                    tracing::info!("bridge writer closed");
+                                    break 'outer;
+                                }
                             }
                         }
                     }
                 }
-            }
-            bridge_event = bridge_event_rx.recv() => {
-                let Some(event) = bridge_event else {
-                    tracing::info!("bridge event channel closed");
-                    break;
-                };
-                tracing::info!("received bridge event: {event:?}");
-                if let Err(e) = handle_outbound_event(&manager, event, last_signal_sender.as_deref()).await {
-                    tracing::warn!("failed to handle bridge event: {e}");
+                bridge_event = bridge_event_rx.recv() => {
+                    let Some(event) = bridge_event else {
+                        tracing::info!("bridge event channel closed");
+                        break 'outer;
+                    };
+                    tracing::info!("received bridge event: {event:?}");
+                    if let Err(e) = handle_outbound_event(&manager, event, last_signal_sender.as_deref()).await {
+                        tracing::warn!("failed to handle bridge event: {e}");
+                    }
                 }
             }
         }
