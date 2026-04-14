@@ -676,44 +676,69 @@ async fn upload_file_attachment(
 /// found paths and a cleaned version of the text with the raw paths removed.
 fn extract_file_paths(text: &str) -> (Vec<std::path::PathBuf>, String) {
     let mut paths = Vec::new();
-    let mut clean_lines = Vec::new();
 
-    for line in text.lines() {
-        let trimmed = line.trim();
-
-        // Check for common patterns: bare path, backtick-wrapped path, **path**
-        let candidate = trimmed
-            .trim_start_matches('`')
-            .trim_end_matches('`')
-            .trim_start_matches("**")
-            .trim_end_matches("**")
-            .trim();
-
-        // Expand ~ to home dir
-        let expanded = if candidate.starts_with("~/") {
+    // Scan the entire text for substrings that look like file paths.
+    // Match /absolute/paths and ~/home/paths, allowing them to be wrapped
+    // in backticks, quotes, bold markers, or markdown list items.
+    for word in split_path_candidates(text) {
+        let expanded = if word.starts_with("~/") {
             if let Some(home) = std::env::var_os("HOME") {
-                std::path::PathBuf::from(home).join(&candidate[2..])
+                std::path::PathBuf::from(home).join(&word[2..])
             } else {
-                std::path::PathBuf::from(candidate)
+                continue;
             }
         } else {
-            std::path::PathBuf::from(candidate)
+            std::path::PathBuf::from(&word)
         };
 
         if expanded.is_absolute() && expanded.exists() && expanded.is_file() {
             paths.push(expanded);
-            // Keep the line but don't remove it — the text context is useful
-            clean_lines.push(line.to_string());
-        } else {
-            clean_lines.push(line.to_string());
         }
     }
 
-    // Deduplicate paths
     paths.sort();
     paths.dedup();
 
-    (paths, clean_lines.join("\n"))
+    (paths, text.to_string())
+}
+
+/// Extract candidate file paths from text. Finds substrings starting with
+/// `/` or `~/` and ending at whitespace or common delimiters.
+fn split_path_candidates(text: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Look for path start: / or ~/
+        let is_path_start = chars[i] == '/'
+            || (chars[i] == '~' && i + 1 < len && chars[i + 1] == '/');
+
+        if is_path_start {
+            let start = i;
+            // Consume until whitespace or end-of-path delimiter
+            while i < len && !is_path_end(chars[i]) {
+                i += 1;
+            }
+            let mut candidate: String = chars[start..i].iter().collect();
+            // Strip trailing punctuation that's likely not part of the path
+            while candidate.ends_with(|c: char| "`*\"')],;:".contains(c)) {
+                candidate.pop();
+            }
+            if candidate.len() > 1 {
+                results.push(candidate);
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    results
+}
+
+fn is_path_end(c: char) -> bool {
+    c.is_whitespace() || c == '\n' || c == '\r'
 }
 
 /// Handle an outbound event from zeroclaw by routing it through presage.
