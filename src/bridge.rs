@@ -401,6 +401,166 @@ fn content_to_bridge_message(
     ))
 }
 
+/// Resolve a bridge recipient to the actual Signal address.
+fn resolve_recipient(recipient: &str, last_signal_sender: Option<&str>) -> anyhow::Result<String> {
+    match parse_recipient(recipient) {
+        Ok(_) => Ok(recipient.to_string()),
+        Err(_) => last_signal_sender
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot route reply to '{recipient}': no Signal sender known yet")
+            })
+            .map(String::from),
+    }
+}
+
+/// Send a text message with optional file attachments via presage.
+///
+/// Scans the message text for file paths (lines matching existing files).
+/// Found files are uploaded as Signal attachments alongside the text.
+async fn send_signal_message(
+    manager: &Arc<Mutex<Manager<SqliteStore, Registered>>>,
+    recipient: &str,
+    text: String,
+) -> anyhow::Result<()> {
+    let target = parse_recipient(recipient)?;
+    let timestamp = now_millis();
+
+    // Detect file paths in the message text and upload as attachments.
+    let (file_paths, clean_text) = extract_file_paths(&text);
+    let mut attachment_pointers = Vec::new();
+
+    if !file_paths.is_empty() {
+        let mut guard = manager.lock().await;
+        for path in &file_paths {
+            match upload_file_attachment(&mut *guard, path).await {
+                Ok(pointer) => {
+                    tracing::info!("uploaded attachment: {}", path.display());
+                    attachment_pointers.push(pointer);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to upload attachment {}: {e}", path.display());
+                }
+            }
+        }
+        drop(guard);
+    }
+
+    let body_text = if attachment_pointers.is_empty() {
+        text
+    } else {
+        clean_text
+    };
+
+    let data_message = presage::libsignal_service::content::DataMessage {
+        body: Some(body_text),
+        timestamp: Some(timestamp),
+        attachments: attachment_pointers,
+        ..Default::default()
+    };
+
+    let mut guard = manager.lock().await;
+    match target {
+        RecipientTarget::Direct(service_id) => {
+            guard
+                .send_message(service_id, data_message, timestamp)
+                .await
+                .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
+        }
+        RecipientTarget::Group(key_bytes) => {
+            guard
+                .send_message_to_group(&key_bytes, data_message, timestamp)
+                .await
+                .map_err(|e| anyhow::anyhow!("group send failed: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Upload a local file as a Signal attachment.
+async fn upload_file_attachment(
+    manager: &mut Manager<SqliteStore, Registered>,
+    path: &std::path::Path,
+) -> anyhow::Result<presage::proto::AttachmentPointer> {
+    use presage::libsignal_service::sender::AttachmentSpec;
+
+    let data = tokio::fs::read(path).await?;
+    let content_type = mime_guess::from_path(path)
+        .first()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string());
+
+    let spec = AttachmentSpec {
+        content_type,
+        length: data.len(),
+        file_name,
+        preview: None,
+        voice_note: None,
+        borderless: None,
+        width: None,
+        height: None,
+        caption: None,
+        blur_hash: None,
+    };
+
+    let result = manager
+        .upload_attachment(spec, data)
+        .await
+        .map_err(|e| anyhow::anyhow!("upload transport error: {e}"))?
+        .map_err(|e| anyhow::anyhow!("upload error: {e:?}"))?;
+
+    Ok(result)
+}
+
+/// Extract file paths from message text.
+///
+/// Looks for lines or inline references to existing files. Returns the
+/// found paths and a cleaned version of the text with the raw paths removed.
+fn extract_file_paths(text: &str) -> (Vec<std::path::PathBuf>, String) {
+    let mut paths = Vec::new();
+    let mut clean_lines = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        // Check for common patterns: bare path, backtick-wrapped path, **path**
+        let candidate = trimmed
+            .trim_start_matches('`')
+            .trim_end_matches('`')
+            .trim_start_matches("**")
+            .trim_end_matches("**")
+            .trim();
+
+        // Expand ~ to home dir
+        let expanded = if candidate.starts_with("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                std::path::PathBuf::from(home).join(&candidate[2..])
+            } else {
+                std::path::PathBuf::from(candidate)
+            }
+        } else {
+            std::path::PathBuf::from(candidate)
+        };
+
+        if expanded.is_absolute() && expanded.exists() && expanded.is_file() {
+            paths.push(expanded);
+            // Keep the line but don't remove it — the text context is useful
+            clean_lines.push(line.to_string());
+        } else {
+            clean_lines.push(line.to_string());
+        }
+    }
+
+    // Deduplicate paths
+    paths.sort();
+    paths.dedup();
+
+    (paths, clean_lines.join("\n"))
+}
+
 /// Handle an outbound event from zeroclaw by routing it through presage.
 ///
 /// The `recipient` from zeroclaw is the bridge sender_id (e.g. "signal").
@@ -414,49 +574,16 @@ async fn handle_outbound_event(
         BridgeOutbound::Message {
             recipient, content, ..
         } => {
-            // Try parsing the recipient directly (UUID or group key).
-            // If that fails, fall back to the last known Signal sender.
-            let effective_recipient = match parse_recipient(&recipient) {
-                Ok(_) => recipient.clone(),
-                Err(_) => last_signal_sender
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "cannot route reply to '{recipient}': no Signal sender known yet"
-                    ))?
-                    .to_string(),
-            };
-            tracing::info!("sending reply to Signal recipient: {effective_recipient}");
-            let target = parse_recipient(&effective_recipient)?;
-            let timestamp = now_millis();
-            let data_message = presage::libsignal_service::content::DataMessage {
-                body: Some(content),
-                timestamp: Some(timestamp),
-                ..Default::default()
-            };
-
-            let mut guard = manager.lock().await;
-            match target {
-                RecipientTarget::Direct(service_id) => {
-                    guard
-                        .send_message(service_id, data_message, timestamp)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
-                }
-                RecipientTarget::Group(key_bytes) => {
-                    guard
-                        .send_message_to_group(&key_bytes, data_message, timestamp)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("group send failed: {e}"))?;
-                }
-            }
+            let effective = resolve_recipient(&recipient, last_signal_sender)?;
+            tracing::info!("sending reply to Signal recipient: {effective}");
+            send_signal_message(manager, &effective, content).await?;
         }
         BridgeOutbound::Typing {
             recipient, active, ..
         } => {
             if active {
-                let effective = match parse_recipient(&recipient) {
-                    Ok(_) => recipient.clone(),
-                    Err(_) => last_signal_sender.unwrap_or_default().to_string(),
-                };
+                let effective = resolve_recipient(&recipient, last_signal_sender)
+                    .unwrap_or_default();
                 if let Ok(RecipientTarget::Direct(service_id)) = parse_recipient(&effective) {
                     let timestamp = now_millis();
                     let typing = ContentBody::TypingMessage(
@@ -478,38 +605,14 @@ async fn handle_outbound_event(
             }
         }
         // Draft finalize = the complete response. Send it as a Signal message.
-        BridgeOutbound::Draft {
-            event, text, ..
-        } => {
+        BridgeOutbound::Draft { event, text, .. } => {
             if event == "finalize" {
                 if let Some(text) = text {
-                    let effective_recipient = last_signal_sender
-                        .ok_or_else(|| anyhow::anyhow!("draft finalize but no Signal sender known"))?
-                        .to_string();
-                    tracing::info!("sending finalized draft to Signal recipient: {effective_recipient}");
-                    let target = parse_recipient(&effective_recipient)?;
-                    let timestamp = now_millis();
-                    let data_message = presage::libsignal_service::content::DataMessage {
-                        body: Some(text),
-                        timestamp: Some(timestamp),
-                        ..Default::default()
-                    };
-                    let mut guard = manager.lock().await;
-                    match target {
-                        RecipientTarget::Direct(service_id) => {
-                            guard.send_message(service_id, data_message, timestamp)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
-                        }
-                        RecipientTarget::Group(key_bytes) => {
-                            guard.send_message_to_group(&key_bytes, data_message, timestamp)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("group send failed: {e}"))?;
-                        }
-                    }
+                    let effective = resolve_recipient("signal", last_signal_sender)?;
+                    tracing::info!("sending finalized draft to Signal recipient: {effective}");
+                    send_signal_message(manager, &effective, text).await?;
                 }
             }
-            // Ignore draft start/update — only finalize triggers a Signal send
         }
         // Reaction, Ack, Pong — no Signal-side action needed
         BridgeOutbound::Pong { .. } | BridgeOutbound::Ack { .. } => {}
