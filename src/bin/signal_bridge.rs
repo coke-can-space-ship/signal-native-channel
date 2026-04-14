@@ -32,11 +32,21 @@ fn main() -> anyhow::Result<()> {
     let auth_token = get_arg("--auth-token")
         .ok_or_else(|| anyhow::anyhow!("--auth-token is required"))?;
 
+    let sender_id = get_arg("--sender-id").unwrap_or_else(|| "signal".to_string());
+
+    // Default session file: ~/.zeroclaw/workspace/sessions/bridge_{sender_id}_{sender_id}.jsonl
+    let default_session_file = {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+            .join(".zeroclaw/workspace/sessions")
+            .join(format!("bridge_{sender_id}_{sender_id}.jsonl"))
+    };
+
     let config = BridgeAdapterConfig {
         bridge_url: get_arg("--bridge-url")
             .unwrap_or_else(|| "ws://127.0.0.1:8765/ws".to_string()),
         auth_token,
-        sender_id: get_arg("--sender-id").unwrap_or_else(|| "signal".to_string()),
+        sender_id,
         db_path: get_arg("--db-path")
             .map(PathBuf::from)
             .unwrap_or_else(default_db_path),
@@ -44,6 +54,11 @@ fn main() -> anyhow::Result<()> {
             .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
             .unwrap_or_else(|| vec!["*".to_string()]),
         group_filter: get_arg("--group-filter"),
+        session_file: Some(
+            get_arg("--session-file")
+                .map(PathBuf::from)
+                .unwrap_or(default_session_file),
+        ),
     };
 
     eprintln!("signal-bridge starting");

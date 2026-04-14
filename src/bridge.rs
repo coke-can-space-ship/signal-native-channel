@@ -6,6 +6,7 @@
 //! - Forwards inbound Signal messages as `{"type":"message",...}`
 //! - Receives outbound events from ZeroClaw and routes them through presage
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -116,6 +117,9 @@ pub struct BridgeAdapterConfig {
     pub allowed_from: Vec<String>,
     /// Optional group filter (`"dm"` for DMs only, or a hex group master key).
     pub group_filter: Option<String>,
+    /// Path to the zeroclaw session JSONL file to watch for `sessions_send` messages.
+    /// When set, the adapter watches for new entries and delivers them to Signal.
+    pub session_file: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +214,27 @@ async fn run_session(
     // Key: bridge sender_id ("signal"), Value: Signal UUID or group target.
     let mut last_signal_sender: Option<String> = None;
 
+    // Channel for messages from the session file watcher.
+    let (session_msg_tx, mut session_msg_rx) = mpsc::channel::<String>(16);
+
+    // Shared set of message contents we forwarded FROM Signal, so the session
+    // watcher can skip them (avoid echo loop).
+    let sent_from_signal: Arc<Mutex<std::collections::VecDeque<String>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
+
+    // Task: watch the session JSONL file for `sessions_send` injections.
+    if let Some(ref session_file) = config.session_file {
+        let session_file = session_file.clone();
+        let tx = session_msg_tx.clone();
+        let sent_from_signal = Arc::clone(&sent_from_signal);
+        tokio::task::spawn_local(async move {
+            if let Err(e) = watch_session_file(&session_file, tx, sent_from_signal).await {
+                tracing::warn!("session file watcher error: {e}");
+            }
+        });
+    }
+    drop(session_msg_tx); // drop our copy so the channel closes when the watcher stops
+
     // Task: read from bridge WS, forward parsed events via mpsc
     let bridge_reader = tokio::task::spawn_local(async move {
         while let Some(msg) = ws_source.next().await {
@@ -226,13 +251,14 @@ async fn run_session(
                     break;
                 }
             };
+            tracing::info!("bridge ws frame: {}", &text[..text.len().min(200)]);
             match serde_json::from_str::<BridgeOutbound>(&text) {
                 Ok(event) => {
                     if bridge_event_tx.send(event).await.is_err() {
                         break;
                     }
                 }
-                Err(e) => tracing::debug!("ignoring unparseable bridge event: {e}"),
+                Err(e) => tracing::warn!("failed to parse bridge event: {e} | raw: {}", &text[..text.len().min(300)]),
             }
         }
     });
@@ -292,13 +318,19 @@ async fn run_session(
                         Received::Contacts => {
                             tracing::debug!("signal: contacts synced");
                         }
-                        Received::Content(content) => {
+                        Received::Content(ref content) => {
                             if let Some((bridge_msg, signal_reply_addr)) = content_to_bridge_message(
-                                &content,
+                                content,
                                 &config.allowed_from,
                                 config.group_filter.as_deref(),
                                 &config.sender_id,
                             ) {
+                                // Track this content so session watcher skips it (avoid echo)
+                                if let BridgeInbound::Message { content: ref msg_content, .. } = bridge_msg {
+                                    let mut guard = sent_from_signal.lock().await;
+                                    guard.push_back(msg_content.clone());
+                                    if guard.len() > 50 { guard.pop_front(); }
+                                }
                                 last_signal_sender = Some(signal_reply_addr);
                                 let payload = serde_json::to_string(&bridge_msg)?;
                                 if signal_tx.send(payload).await.is_err() {
@@ -317,6 +349,18 @@ async fn run_session(
                     tracing::info!("received bridge event: {event:?}");
                     if let Err(e) = handle_outbound_event(&manager, event, last_signal_sender.as_deref()).await {
                         tracing::warn!("failed to handle bridge event: {e}");
+                    }
+                }
+                session_msg = session_msg_rx.recv() => {
+                    if let Some(content) = session_msg {
+                        if let Some(ref recipient) = last_signal_sender {
+                            tracing::info!("session_send detected, delivering to Signal: {}", &content[..content.len().min(100)]);
+                            if let Err(e) = send_signal_message(&manager, recipient, content).await {
+                                tracing::warn!("failed to deliver session_send message: {e}");
+                            }
+                        } else {
+                            tracing::warn!("session_send message but no Signal sender known, dropping");
+                        }
                     }
                 }
             }
@@ -399,6 +443,86 @@ fn content_to_bridge_message(
         },
         reply_address,
     ))
+}
+
+/// Watch a zeroclaw session JSONL file for new `sessions_send` messages.
+///
+/// `sessions_send` appends `{"role":"user","content":"..."}` entries.
+/// We detect new lines added after we start watching and forward the content.
+/// We skip entries that look like they came from Signal (our own inbound messages).
+async fn watch_session_file(
+    path: &std::path::Path,
+    tx: mpsc::Sender<String>,
+    sent_from_signal: Arc<Mutex<VecDeque<String>>>,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+
+    // Wait for the file to exist
+    loop {
+        if path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let file = tokio::fs::File::open(path).await?;
+    let reader = tokio::io::BufReader::new(file);
+    let mut lines = reader.lines();
+
+    // Skip all existing lines (we only care about new appends)
+    while lines.next_line().await?.is_some() {}
+
+    tracing::info!("session file watcher started: {}", path.display());
+
+    // Poll for new lines
+    loop {
+        match lines.next_line().await? {
+            Some(line) => {
+                // Parse the JSONL entry
+                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
+                    // sessions_send appends role:"user" entries.
+                    // Our own inbound Signal messages also appear as role:"user" but they
+                    // go through the bridge channel, not sessions_send. The bridge channel
+                    // creates the ChannelMessage which zeroclaw processes — those entries
+                    // appear with the user's actual message. sessions_send entries are
+                    // injected programmatically by the LLM's tool call.
+                    //
+                    // We detect sessions_send entries by checking: role is "user" AND
+                    // the content doesn't start with typical Signal message patterns.
+                    // This is heuristic — the reliable signal is that sessions_send entries
+                    // appear AFTER an assistant tool_call to sessions_send.
+                    let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                    let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if role == "user" && !content.is_empty() {
+                        // Check if this message was forwarded from Signal (echo).
+                        // If so, skip it to avoid sending it back to the user.
+                        let is_echo = {
+                            let mut guard = sent_from_signal.lock().await;
+                            if let Some(pos) = guard.iter().position(|s| s == content) {
+                                guard.remove(pos);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if !is_echo {
+                            tracing::info!("session watcher: new sessions_send message detected");
+                            if tx.send(content.to_string()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                // EOF — file hasn't grown yet. Poll.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve a bridge recipient to the actual Signal address.
