@@ -445,84 +445,115 @@ fn content_to_bridge_message(
     ))
 }
 
-/// Watch a zeroclaw session JSONL file for new `sessions_send` messages.
+/// Watch a zeroclaw sessions directory for `sessions_send` messages.
 ///
-/// `sessions_send` appends `{"role":"user","content":"..."}` entries.
-/// We detect new lines added after we start watching and forward the content.
-/// We skip entries that look like they came from Signal (our own inbound messages).
+/// `sessions_send` appends `{"role":"user","content":"..."}` entries to
+/// session JSONL files. The target session may be any `bridge_*.jsonl` file
+/// in the directory — not necessarily the main conversation session.
+///
+/// We scan all matching files for new entries and forward their content.
 async fn watch_session_file(
     path: &std::path::Path,
     tx: mpsc::Sender<String>,
     sent_from_signal: Arc<Mutex<VecDeque<String>>>,
 ) -> anyhow::Result<()> {
-    use tokio::io::AsyncBufReadExt;
+    // `path` points to a specific JSONL file. Watch its parent directory
+    // for ALL bridge_*.jsonl files.
+    let sessions_dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("session file has no parent directory"))?
+        .to_path_buf();
 
-    // Wait for the file to exist
-    loop {
-        if path.exists() {
-            break;
+    tracing::info!("session watcher started: watching {}", sessions_dir.display());
+
+    // Track file sizes to detect new content.
+    let mut file_sizes: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
+
+    // Initialize: record current sizes of all matching files.
+    if let Ok(mut entries) = tokio::fs::read_dir(&sessions_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let p = entry.path();
+            if is_bridge_session_file(&p) {
+                if let Ok(meta) = tokio::fs::metadata(&p).await {
+                    file_sizes.insert(p, meta.len());
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    let file = tokio::fs::File::open(path).await?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
-
-    // Skip all existing lines (we only care about new appends)
-    while lines.next_line().await?.is_some() {}
-
-    tracing::info!("session file watcher started: {}", path.display());
-
-    // Poll for new lines
     loop {
-        match lines.next_line().await? {
-            Some(line) => {
-                // Parse the JSONL entry
-                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
-                    // sessions_send appends role:"user" entries.
-                    // Our own inbound Signal messages also appear as role:"user" but they
-                    // go through the bridge channel, not sessions_send. The bridge channel
-                    // creates the ChannelMessage which zeroclaw processes — those entries
-                    // appear with the user's actual message. sessions_send entries are
-                    // injected programmatically by the LLM's tool call.
-                    //
-                    // We detect sessions_send entries by checking: role is "user" AND
-                    // the content doesn't start with typical Signal message patterns.
-                    // This is heuristic — the reliable signal is that sessions_send entries
-                    // appear AFTER an assistant tool_call to sessions_send.
-                    let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                    let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-                    if role == "user" && !content.is_empty() {
-                        // Check if this message was forwarded from Signal (echo).
-                        // If so, skip it to avoid sending it back to the user.
-                        let is_echo = {
-                            let mut guard = sent_from_signal.lock().await;
-                            if let Some(pos) = guard.iter().position(|s| s == content) {
-                                guard.remove(pos);
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if !is_echo {
-                            tracing::info!("session watcher: new sessions_send message detected");
-                            if tx.send(content.to_string()).await.is_err() {
-                                break;
+        let mut entries = match tokio::fs::read_dir(&sessions_dir).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let p = entry.path();
+            if !is_bridge_session_file(&p) {
+                continue;
+            }
+
+            let current_size = match tokio::fs::metadata(&p).await {
+                Ok(meta) => meta.len(),
+                Err(_) => continue,
+            };
+
+            let prev_size = file_sizes.get(&p).copied().unwrap_or(0);
+            if current_size <= prev_size {
+                continue;
+            }
+
+            // File grew — read the new bytes.
+            file_sizes.insert(p.clone(), current_size);
+
+            if let Ok(data) = tokio::fs::read(&p).await {
+                // Only look at bytes after prev_size.
+                let new_bytes = &data[prev_size as usize..];
+                let new_text = String::from_utf8_lossy(new_bytes);
+
+                for line in new_text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+                        let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                        let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+                        if role == "user" && !content.is_empty() {
+                            let is_echo = {
+                                let mut guard = sent_from_signal.lock().await;
+                                if let Some(pos) = guard.iter().position(|s| s == content) {
+                                    guard.remove(pos);
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if !is_echo {
+                                tracing::info!(
+                                    "session watcher: sessions_send detected in {}",
+                                    p.file_name().unwrap_or_default().to_string_lossy()
+                                );
+                                if tx.send(content.to_string()).await.is_err() {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
                 }
             }
-            None => {
-                // EOF — file hasn't grown yet. Poll.
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
         }
     }
+}
 
-    Ok(())
+fn is_bridge_session_file(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "jsonl")
+        && path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("bridge"))
 }
 
 /// Resolve a bridge recipient to the actual Signal address.
