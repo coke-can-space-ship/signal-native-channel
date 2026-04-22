@@ -397,7 +397,6 @@ fn content_to_bridge_message(
         _ => return None,
     };
 
-    let text = body.body.as_deref().filter(|t| !t.is_empty())?;
     let from_uuid = content.metadata.sender.raw_uuid().to_string();
 
     // Allowlist check
@@ -426,20 +425,58 @@ fn content_to_bridge_message(
     }
 
     let timestamp_ms = content.metadata.timestamp;
-
-    // Use the Signal UUID (or group key) as sender_id so zeroclaw's reply
-    // is addressed to a value that parse_recipient can resolve.
     let reply_address = if let Some(ref gk) = group_master_key {
         format!("{GROUP_TARGET_PREFIX}{gk}")
     } else {
         from_uuid.clone()
     };
 
+    // Handle reactions (emoji on a message)
+    if let Some(ref reaction) = body.reaction {
+        let emoji = reaction.emoji.as_deref().unwrap_or("?");
+        let is_remove = reaction.remove.unwrap_or(false);
+        let target_ts = reaction.target_sent_timestamp.unwrap_or(0);
+
+        let action = if is_remove { "removed" } else { "reacted" };
+        let message_text = format!(
+            "[{action} {emoji} on message signative_{target_ts}]"
+        );
+        tracing::info!("signal reaction: {from_uuid} {action} {emoji} on ts {target_ts}");
+
+        return Some((
+            BridgeInbound::Message {
+                id: format!("signative_{timestamp_ms}_{}", &from_uuid[..8]),
+                sender_id: bridge_sender_id.to_string(),
+                content: message_text,
+            },
+            reply_address,
+        ));
+    }
+
+    let text = body.body.as_deref().filter(|t| !t.is_empty())?;
+
+    // Handle quoted replies (replying to a specific message)
+    let message_text = if let Some(ref quote) = body.quote {
+        let quoted_text = quote.text.as_deref().unwrap_or("");
+        let quoted_ts = quote.id.unwrap_or(0);
+        // Include the quote context so zeroclaw knows what the user is replying to
+        let snippet = if quoted_text.len() > 100 {
+            format!("{}...", &quoted_text[..100])
+        } else {
+            quoted_text.to_string()
+        };
+        format!(
+            "[replying to signative_{quoted_ts}: \"{snippet}\"]\n\n{text}"
+        )
+    } else {
+        text.to_string()
+    };
+
     Some((
         BridgeInbound::Message {
             id: format!("signative_{timestamp_ms}_{}", &from_uuid[..8]),
             sender_id: bridge_sender_id.to_string(),
-            content: text.to_string(),
+            content: message_text,
         },
         reply_address,
     ))
